@@ -20,6 +20,8 @@
  */
 
 #include <thrust/detail/config.h>
+#include <thrust/reduce.h>
+#include <thrust/detail/seq.h>
 #include <thrust/detail/temporary_array.h>
 #include <thrust/system/cuda/detail/bulk.h>
 #include <thrust/system/cuda/detail/decomposition.h>
@@ -44,7 +46,7 @@ struct reduce_partitions
   __device__
   void operator()(ConcurrentGroup &this_group, Iterator1 first, Iterator1 last, Iterator2 result, T init, BinaryOperation binary_op)
   {
-    T sum = bulk::reduce(this_group, first, last, init, binary_op);
+    T sum = bulk_::reduce(this_group, first, last, init, binary_op);
 
     if(this_group.this_exec.index() == 0)
     {
@@ -83,18 +85,16 @@ struct reduce_partitions
 };
 
 
-} // end reduce_detail
-
-
 template<typename DerivedPolicy,
          typename InputIterator,
          typename OutputType,
          typename BinaryFunction>
-  OutputType reduce(execution_policy<DerivedPolicy> &exec,
-                    InputIterator first,
-                    InputIterator last,
-                    OutputType init,
-                    BinaryFunction binary_op)
+__host__ __device__
+OutputType reduce(execution_policy<DerivedPolicy> &exec,
+                  InputIterator first,
+                  InputIterator last,
+                  OutputType init,
+                  BinaryFunction binary_op)
 {
   typedef typename thrust::iterator_difference<InputIterator>::type size_type;
 
@@ -105,13 +105,13 @@ template<typename DerivedPolicy,
   cudaStream_t s = stream(thrust::detail::derived_cast(exec));
 
   const size_type groupsize = 128;
-  const size_type grainsize = 9;
+  const size_type grainsize = 7;
   const size_type tile_size = groupsize * grainsize;
   const size_type num_tiles = (n + tile_size - 1) / tile_size;
   const size_type subscription = 10;
 
-  bulk::concurrent_group<
-    bulk::agent<grainsize>,
+  bulk_::concurrent_group<
+    bulk_::agent<grainsize>,
     groupsize
   > g;
 
@@ -122,15 +122,67 @@ template<typename DerivedPolicy,
   thrust::detail::temporary_array<OutputType,DerivedPolicy> partial_sums(exec, decomp.size());
 
   // reduce into partial sums
-  bulk::async(bulk::par(s, g, decomp.size()), reduce_detail::reduce_partitions(), bulk::root.this_exec, first, decomp, partial_sums.begin(), init, binary_op).wait();
+  bulk_::async(bulk_::par(s, g, decomp.size()), reduce_detail::reduce_partitions(), bulk_::root.this_exec, first, decomp, partial_sums.begin(), init, binary_op).wait();
 
   if(partial_sums.size() > 1)
   {
     // reduce the partial sums
-    bulk::async(bulk::par(s, g, 1), reduce_detail::reduce_partitions(), bulk::root.this_exec, partial_sums.begin(), partial_sums.end(), partial_sums.begin(), binary_op);
+    bulk_::async(bulk_::par(s, g, 1), reduce_detail::reduce_partitions(), bulk_::root.this_exec, partial_sums.begin(), partial_sums.end(), partial_sums.begin(), binary_op);
   } // end while
 
   return partial_sums[0];
+} // end reduce()
+
+
+} // end reduce_detail
+
+
+template<typename DerivedPolicy,
+         typename InputIterator,
+         typename OutputType,
+         typename BinaryFunction>
+__host__ __device__
+OutputType reduce(execution_policy<DerivedPolicy> &exec,
+                  InputIterator first,
+                  InputIterator last,
+                  OutputType init,
+                  BinaryFunction binary_op)
+{
+  // we're attempting to launch a kernel, assert we're compiling with nvcc
+  // ========================================================================
+  // X Note to the user: If you've found this line due to a compiler error, X
+  // X you need to compile your code using nvcc, rather than g++ or cl.exe  X
+  // ========================================================================
+  THRUST_STATIC_ASSERT( (thrust::detail::depend_on_instantiation<InputIterator, THRUST_DEVICE_COMPILER == THRUST_DEVICE_COMPILER_NVCC>::value) );
+
+  struct workaround
+  {
+    __host__ __device__
+    static OutputType parallel_path(execution_policy<DerivedPolicy> &exec,
+                                    InputIterator first,
+                                    InputIterator last,
+                                    OutputType init,
+                                    BinaryFunction binary_op)
+    {
+      return thrust::system::cuda::detail::reduce_detail::reduce(exec, first, last, init, binary_op);
+    }
+
+    __host__ __device__
+    static OutputType sequential_path(execution_policy<DerivedPolicy> &,
+                                      InputIterator first,
+                                      InputIterator last,
+                                      OutputType init,
+                                      BinaryFunction binary_op)
+    {
+      return thrust::reduce(thrust::seq, first, last, init, binary_op);
+    }
+  };
+
+#if __BULK_HAS_CUDART__
+  return workaround::parallel_path(exec, first, last, init, binary_op);
+#else
+  return workaround::sequential_path(exec, first, last, init, binary_op);
+#endif
 } // end reduce()
 
 
